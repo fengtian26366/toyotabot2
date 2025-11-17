@@ -63,12 +63,20 @@ def fmt_dur_mmss(seconds: int) -> str:
     m, s = divmod(seconds, 60)
     return f"{m}分{s:02d}秒"
 
-def ensure_stats_container(ud: dict) -> dict:
-    return ud.setdefault("stats", {
-        "smoke":  {"count": 0, "dur": 0},
-        "toilet": {"count": 0, "dur": 0},
-        "meal":   {"count": 0, "dur": 0},
-    })
+def ensure_stats_for_chat(ud: dict, chat_id: int) -> dict:
+    """
+    每个用户按群单独统计：
+    ud["stats_by_chat"][chat_id]["smoke"|"toilet"|"meal"]["count"|"dur"]
+    """
+    all_stats = ud.setdefault("stats_by_chat", {})
+    key = str(chat_id)
+    if key not in all_stats:
+        all_stats[key] = {
+            "smoke":  {"count": 0, "dur": 0},
+            "toilet": {"count": 0, "dur": 0},
+            "meal":   {"count": 0, "dur": 0},
+        }
+    return all_stats[key]
 
 async def is_admin(update: Update) -> bool:
     try:
@@ -109,18 +117,41 @@ START_RE = re.compile(r"^(" + "|".join(map(re.escape, sorted(all_trigger_words()
 # 回来可用数字 1
 BACK_RE  = re.compile(r"^(回来|回|back|1)$", re.IGNORECASE)
 
-# ========= 删除帮助/提示类消息 =========
+# ========= 删除帮助/提示类消息（保护群主/管理员） =========
 async def delete_help_messages(context: ContextTypes.DEFAULT_TYPE):
+    """
+    延迟删除类消息：
+    - user_msg_id：用户发的那条
+    - bot_msg_id：机器人回的那条
+    对群主/管理员：不删用户消息，只删机器人自己的。
+    """
     data = context.job.data or {}
     chat_id = data.get("chat_id")
-    mids = data.get("message_ids") or []
+    user_msg_id = data.get("user_msg_id")
+    bot_msg_id = data.get("bot_msg_id")
+    user_id = data.get("user_id")
+
     if not chat_id:
         return
-    for mid in mids:
-        if not mid:
-            continue
+
+    # 先删机器人自己的那条
+    if bot_msg_id:
         try:
-            await context.bot.delete_message(chat_id, mid)
+            await context.bot.delete_message(chat_id, bot_msg_id)
+        except Exception:
+            pass
+
+    # 用户那条：群主/管理员不删
+    if user_msg_id and user_id:
+        try:
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            if member.status in ("creator", "administrator"):
+                return  # 群主/管理员，不删他发的那条
+        except Exception:
+            # 查不到就当普通人处理
+            pass
+        try:
+            await context.bot.delete_message(chat_id, user_msg_id)
         except Exception:
             pass
 
@@ -135,7 +166,7 @@ async def begin(update: Update, ctx: ContextTypes.DEFAULT_TYPE, kind: str):
 
     ud = ctx.user_data
 
-    # 已有进行中的打卡：提示 + 定时删除
+    # 已有进行中的打卡：提示 + 定时删除（保护群主/管理员）
     if ud.get("active"):
         notice = await msg.reply_html(
             f"{mention_user_html(user)} 已有进行中的打卡，请先发送“回来/回/back/1”或 /back 结束。"
@@ -143,12 +174,17 @@ async def begin(update: Update, ctx: ContextTypes.DEFAULT_TYPE, kind: str):
         ctx.job_queue.run_once(
             delete_help_messages,
             when=HELP_DELETE_MINUTES * 60,
-            data={"chat_id": chat.id, "message_ids": [msg.id, notice.message_id]},
+            data={
+                "chat_id": chat.id,
+                "user_msg_id": msg.id,
+                "bot_msg_id": notice.message_id,
+                "user_id": user.id,
+            },
             name=f"del-already-{chat.id}-{msg.id}",
         )
         return
 
-    stats = ensure_stats_container(ud)
+    stats = ensure_stats_for_chat(ud, chat.id)
     today_count = stats[kind]["count"]
     limit_count = LIMITS_COUNT.get(kind, 0)
     if limit_count and today_count >= limit_count:
@@ -230,16 +266,30 @@ async def end_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
     active = ud.get("active")
 
-    # 当前没有进行中的打卡：提示 + 自动删除两条
+    # 当前没有进行中的打卡：提示 + 自动删除两条（保护群主/管理员）
     if not active:
         notice = await msg.reply_html(f"{mention_user_html(user)} 当前没有进行中的打卡。")
         ctx.job_queue.run_once(
             delete_help_messages,
             when=HELP_DELETE_MINUTES * 60,
-            data={"chat_id": chat.id, "message_ids": [msg.id, notice.message_id]},
+            data={
+                "chat_id": chat.id,
+                "user_msg_id": msg.id,
+                "bot_msg_id": notice.message_id,
+                "user_id": user.id,
+            },
             name=f"del-noactive-{chat.id}-{msg.id}",
         )
         return
+
+    # 判断是否群主/管理员
+    is_owner_or_admin = False
+    try:
+        member = await chat.get_member(user.id)
+        if member.status in ("creator", "administrator"):
+            is_owner_or_admin = True
+    except Exception:
+        pass
 
     # 先删 3 条消息：开始指令 + 开始提示 + 回来
     start_user_msg_id = ud.pop("start_user_msg_id", None)
@@ -247,11 +297,15 @@ async def end_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     back_msg_id       = msg.id
 
     for mid in (start_user_msg_id, start_bot_msg_id, back_msg_id):
-        if mid:
-            try:
-                await ctx.bot.delete_message(chat.id, mid)
-            except Exception:
-                pass
+        if not mid:
+            continue
+        # 群主/管理员：只删机器人那条（start_bot_msg_id），不删他自己的指令
+        if is_owner_or_admin and mid != start_bot_msg_id:
+            continue
+        try:
+            await ctx.bot.delete_message(chat.id, mid)
+        except Exception:
+            pass
 
     # 取消超时/宽限提醒
     for key in ("reminder_job", "grace_job"):
@@ -271,7 +325,7 @@ async def end_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     title = active.get("title", "打卡")
     key   = active["type"]
 
-    stats = ensure_stats_container(ud)
+    stats = ensure_stats_for_chat(ud, chat.id)
 
     # 未达最小时长：不计入统计、不开冷却
     if used_sec < MIN_SECONDS.get(key, 0):
@@ -435,12 +489,13 @@ async def reset_shift(context: ContextTypes.DEFAULT_TYPE):
         ud.pop("start_bot_msg_id", None)
         ud["_last_seen"] = now_utc.timestamp()
 
-    # 清空当班统计；长期不用的用户清理
+    # 清空当班统计（所有群），长期不用的用户清理
     for _uid, ud in list(app.user_data.items()):
-        stats = ensure_stats_container(ud)
-        for k in stats:
-            stats[k]["count"] = 0
-            stats[k]["dur"] = 0
+        all_stats = ud.get("stats_by_chat") or {}
+        for chat_stats in all_stats.values():
+            for k in chat_stats:
+                chat_stats[k]["count"] = 0
+                chat_stats[k]["dur"] = 0
         last = ud.get("_last_seen")
         if (not ud.get("active")) and last and (now_utc.timestamp() - last > 30 * 86400):
             try:
@@ -457,7 +512,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                "• 时长：厕所10分，抽烟10分，吃饭30分；到时提醒；超时提示。\n"
                "• 最小时长：厕所30秒、抽烟30秒、吃饭60秒，未达不计且不冷却。\n"
                f"• 超时：到时提醒本人，{GRACE_MINUTES} 分钟后仍未结束会@管理员。\n"
-               "• 管理：/who /summary /setlimit /setcount /mute /unmute /testshift")
+               "• 管理：/who /summary /setlimit /setcount /mute /unmute")
     else:
         txt = ("打卡说明：\n"
                "• 开始：发送“厕所 / 抽烟 / 吃饭”（或 wc / smoke / eat）\n"
@@ -486,15 +541,19 @@ async def cmd_who(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"已用 <b>{fmt_dur_mmss(int((now_utc - start).total_seconds()))}</b> | "
             f"开始 <b>{start.astimezone(LOCAL_TZ).strftime('%H:%M')}</b> | ID <code>{uid}</code>"
         )
-    await update.effective_message.reply_html("📋 当前未结束清单：\n" + "\n".join(lines) if lines else "👍 本群当前无人处于进行中状态。")
+    await update.effective_message.reply_html(
+        "📋 当前未结束清单：\n" + "\n".join(lines) if lines else "👍 本群当前无人处于进行中状态。"
+    )
 
 async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
         return await update.effective_message.reply_html("❌ 仅管理员可用。")
+    chat = update.effective_chat
     app = ctx.application
     lines = [f"📊 本{current_shift_label()}汇总（按用户）："]
     for uid, ud in list(app.user_data.items()):
-        stats = ud.get("stats") or {}
+        all_stats = ud.get("stats_by_chat") or {}
+        stats = all_stats.get(str(chat.id)) or {}
         per = []
         for k in ("smoke", "toilet", "meal"):
             c = stats.get(k, {}).get("count", 0)
@@ -503,7 +562,9 @@ async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 per.append(f"{TITLES[k]} <b>{c}</b> 次 / {fmt_dur_mmss(d)}")
         if per:
             lines.append(f"• {mention_id_html(uid, '这位同事')} — " + "；".join(per))
-    await update.effective_message.reply_html("\n".join(lines) if len(lines) > 1 else "暂无数据。")
+    await update.effective_message.reply_html(
+        "\n".join(lines) if len(lines) > 1 else "暂无数据。"
+    )
 
 async def cmd_setlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update):
@@ -553,12 +614,6 @@ async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     dt = (perf_counter() - t0) * 1000
     await m.edit_text(f"pong {dt:.0f} ms")
 
-async def cmd_testshift(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update):
-        return await update.effective_message.reply_html("❌ 仅管理员可用。")
-    await reset_shift(ctx)
-    await update.effective_message.reply_html("✅ 已手动执行换班统计。")
-
 # ========= 文本触发 =========
 def normalize_txt(s: str) -> str:
     return (s or "").strip().lower()
@@ -575,19 +630,20 @@ async def text_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if BACK_RE.match(txt):
         await end_session(update, ctx)
 
-# 乱输入统一回打卡说明（除开始/结束触发词），并定时删除
+# 乱输入统一回打卡说明（除开始/结束触发词），并定时删除（保护群主/管理员）
 async def text_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if chat_is_muted(ctx, update.effective_chat.id):
         return
 
     msg  = update.effective_message
     chat = update.effective_chat
+    user = update.effective_user
 
     txt = (
         "打卡说明：\n"
         "• 开始：发送“厕所 / 抽烟 / 吃饭”（或 wc / smoke / eat）\n"
         "• 结束：发送“回来 / 回 / back / 1”\n"
-        "• 管理员：/who /summary /setlimit /setcount /mute /unmute /testshift"
+        "• 管理员：/who /summary /setlimit /setcount /mute /unmute"
     )
 
     sent = await msg.reply_html(txt)
@@ -595,7 +651,12 @@ async def text_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.job_queue.run_once(
         delete_help_messages,
         when=HELP_DELETE_MINUTES * 60,
-        data={"chat_id": chat.id, "message_ids": [msg.id, sent.message_id]},
+        data={
+            "chat_id": chat.id,
+            "user_msg_id": msg.id,
+            "bot_msg_id": sent.message_id,
+            "user_id": user.id,
+        },
         name=f"del-help-{chat.id}-{msg.id}",
     )
 
@@ -613,7 +674,6 @@ async def setup_bot_commands(app: Application):
         BotCommand("setcount", "设置每班次数上限（管理员）"),
         BotCommand("mute", "静音模式（管理员）"),
         BotCommand("unmute", "取消静音（管理员）"),
-        BotCommand("testshift", "手动触发换班（管理员）"),
         BotCommand("id", "查看自己的 user_id"),
         BotCommand("ping", "延迟测试"),
     ]
@@ -649,20 +709,19 @@ def main():
     )
 
     # 命令
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("toilet",    cmd_toilet))
-    app.add_handler(CommandHandler("smoke",     cmd_smoke))
-    app.add_handler(CommandHandler("meal",      cmd_meal))
-    app.add_handler(CommandHandler("back",      cmd_back))
-    app.add_handler(CommandHandler("who",       cmd_who))
-    app.add_handler(CommandHandler("summary",   cmd_summary))
-    app.add_handler(CommandHandler("setlimit",  cmd_setlimit))
-    app.add_handler(CommandHandler("setcount",  cmd_setcount))
-    app.add_handler(CommandHandler("mute",      cmd_mute))
-    app.add_handler(CommandHandler("unmute",    cmd_unmute))
-    app.add_handler(CommandHandler("id",        cmd_id))
-    app.add_handler(CommandHandler("ping",      cmd_ping))
-    app.add_handler(CommandHandler("testshift", cmd_testshift))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("toilet",  cmd_toilet))
+    app.add_handler(CommandHandler("smoke",   cmd_smoke))
+    app.add_handler(CommandHandler("meal",    cmd_meal))
+    app.add_handler(CommandHandler("back",    cmd_back))
+    app.add_handler(CommandHandler("who",     cmd_who))
+    app.add_handler(CommandHandler("summary", cmd_summary))
+    app.add_handler(CommandHandler("setlimit", cmd_setlimit))
+    app.add_handler(CommandHandler("setcount", cmd_setcount))
+    app.add_handler(CommandHandler("mute",    cmd_mute))
+    app.add_handler(CommandHandler("unmute",  cmd_unmute))
+    app.add_handler(CommandHandler("id",      cmd_id))
+    app.add_handler(CommandHandler("ping",    cmd_ping))
 
     # 文本触发（群内）
     app.add_handler(MessageHandler(F.TEXT & F.ChatType.GROUPS & (~F.COMMAND) & F.Regex(START_RE), text_start), group=0)
