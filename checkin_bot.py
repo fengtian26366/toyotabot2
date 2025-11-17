@@ -34,7 +34,7 @@ MIN_SECONDS  = {"toilet": 30, "smoke": 30, "meal": 60}          # 最小时长�
 COOLDOWN_MIN = {"toilet": 5,  "smoke": 5,  "meal": 15}          # 冷却（分钟）
 GRACE_MINUTES = 3                                               # 超时后再等 X 分钟 @ 管理员
 
-HELP_DELETE_MINUTES = 1   # 乱输/无效提示类消息保留时间（分钟）
+HELP_DELETE_MINUTES = 1   # 提示类消息保留时间（分钟）
 
 TITLES = {"toilet": "厕所", "smoke": "抽烟", "meal": "吃饭"}
 
@@ -114,22 +114,19 @@ def all_trigger_words() -> Set[str]:
     return s
 
 START_RE = re.compile(r"^(" + "|".join(map(re.escape, sorted(all_trigger_words()))) + r")$", re.IGNORECASE)
-# 回来可用数字 1
 BACK_RE  = re.compile(r"^(回来|回|back|1)$", re.IGNORECASE)
 
-# ========= 删除帮助/提示类消息（保护群主/管理员） =========
+# ========= 删除提示类消息（仅打卡相关的误操作用） =========
 async def delete_help_messages(context: ContextTypes.DEFAULT_TYPE):
     """
     延迟删除类消息：
     - user_msg_id：用户发的那条
     - bot_msg_id：机器人回的那条
-    对群主/管理员：不删用户消息，只删机器人自己的。
     """
     data = context.job.data or {}
     chat_id = data.get("chat_id")
     user_msg_id = data.get("user_msg_id")
     bot_msg_id = data.get("bot_msg_id")
-    user_id = data.get("user_id")
 
     if not chat_id:
         return
@@ -141,15 +138,8 @@ async def delete_help_messages(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # 用户那条：群主/管理员不删
-    if user_msg_id and user_id:
-        try:
-            member = await context.bot.get_chat_member(chat_id, user_id)
-            if member.status in ("creator", "administrator"):
-                return  # 群主/管理员，不删他发的那条
-        except Exception:
-            # 查不到就当普通人处理
-            pass
+    # 用户那条（打卡相关误操作，也一起删）
+    if user_msg_id:
         try:
             await context.bot.delete_message(chat_id, user_msg_id)
         except Exception:
@@ -166,7 +156,7 @@ async def begin(update: Update, ctx: ContextTypes.DEFAULT_TYPE, kind: str):
 
     ud = ctx.user_data
 
-    # 已有进行中的打卡：提示 + 定时删除（保护群主/管理员）
+    # 已有进行中的打卡：提示 + 定时删除
     if ud.get("active"):
         notice = await msg.reply_html(
             f"{mention_user_html(user)} 已有进行中的打卡，请先发送“回来/回/back/1”或 /back 结束。"
@@ -178,7 +168,6 @@ async def begin(update: Update, ctx: ContextTypes.DEFAULT_TYPE, kind: str):
                 "chat_id": chat.id,
                 "user_msg_id": msg.id,
                 "bot_msg_id": notice.message_id,
-                "user_id": user.id,
             },
             name=f"del-already-{chat.id}-{msg.id}",
         )
@@ -266,7 +255,7 @@ async def end_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
     active = ud.get("active")
 
-    # 当前没有进行中的打卡：提示 + 自动删除两条（保护群主/管理员）
+    # 当前没有进行中的打卡：提示 + 自动删除两条（因为是打卡相关误操作）
     if not active:
         notice = await msg.reply_html(f"{mention_user_html(user)} 当前没有进行中的打卡。")
         ctx.job_queue.run_once(
@@ -276,31 +265,18 @@ async def end_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "chat_id": chat.id,
                 "user_msg_id": msg.id,
                 "bot_msg_id": notice.message_id,
-                "user_id": user.id,
             },
             name=f"del-noactive-{chat.id}-{msg.id}",
         )
         return
 
-    # 判断是否群主/管理员
-    is_owner_or_admin = False
-    try:
-        member = await chat.get_member(user.id)
-        if member.status in ("creator", "administrator"):
-            is_owner_or_admin = True
-    except Exception:
-        pass
-
-    # 先删 3 条消息：开始指令 + 开始提示 + 回来
+    # 先删 3 条消息：开始指令 + 开始提示 + 回来（管理员也一样删）
     start_user_msg_id = ud.pop("start_user_msg_id", None)
     start_bot_msg_id  = ud.pop("start_bot_msg_id", None)
     back_msg_id       = msg.id
 
     for mid in (start_user_msg_id, start_bot_msg_id, back_msg_id):
         if not mid:
-            continue
-        # 群主/管理员：只删机器人那条（start_bot_msg_id），不删他自己的指令
-        if is_owner_or_admin and mid != start_bot_msg_id:
             continue
         try:
             await ctx.bot.delete_message(chat.id, mid)
@@ -630,36 +606,6 @@ async def text_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if BACK_RE.match(txt):
         await end_session(update, ctx)
 
-# 乱输入统一回打卡说明（除开始/结束触发词），并定时删除（保护群主/管理员）
-async def text_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if chat_is_muted(ctx, update.effective_chat.id):
-        return
-
-    msg  = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-
-    txt = (
-        "打卡说明：\n"
-        "• 开始：发送“厕所 / 抽烟 / 吃饭”（或 wc / smoke / eat）\n"
-        "• 结束：发送“回来 / 回 / back / 1”\n"
-        "• 管理员：/who /summary /setlimit /setcount /mute /unmute"
-    )
-
-    sent = await msg.reply_html(txt)
-
-    ctx.job_queue.run_once(
-        delete_help_messages,
-        when=HELP_DELETE_MINUTES * 60,
-        data={
-            "chat_id": chat.id,
-            "user_msg_id": msg.id,
-            "bot_msg_id": sent.message_id,
-            "user_id": user.id,
-        },
-        name=f"del-help-{chat.id}-{msg.id}",
-    )
-
 # ========= 启动前：设置 / 菜单命令 =========
 async def setup_bot_commands(app: Application):
     commands = [
@@ -723,16 +669,9 @@ def main():
     app.add_handler(CommandHandler("id",      cmd_id))
     app.add_handler(CommandHandler("ping",    cmd_ping))
 
-    # 文本触发（群内）
+    # 文本触发（群内）——只响应“厕所/抽烟/吃饭/回来”这类，其他消息完全无视
     app.add_handler(MessageHandler(F.TEXT & F.ChatType.GROUPS & (~F.COMMAND) & F.Regex(START_RE), text_start), group=0)
     app.add_handler(MessageHandler(F.TEXT & F.ChatType.GROUPS & (~F.COMMAND) & F.Regex(BACK_RE),  text_back),  group=1)
-    app.add_handler(
-        MessageHandler(
-            F.TEXT & F.ChatType.GROUPS & (~F.COMMAND) & (~F.Regex(START_RE)) & (~F.Regex(BACK_RE)),
-            text_help
-        ),
-        group=99
-    )
 
     # 定时：07:00 & 19:00（UTC+7）换班统计并清状态
     app.job_queue.run_daily(reset_shift, time=dtime(7, 0, tzinfo=LOCAL_TZ),  name="reset-shift-0700")
